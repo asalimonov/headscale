@@ -135,21 +135,21 @@ func (a *AuthProviderOIDC) RegisterHandler(
 	// the template and log an error.
 	registrationId, err := types.RegistrationIDFromString(registrationIdStr)
 	if err != nil {
-		httpError(writer, NewHTTPError(http.StatusBadRequest, "invalid registration id", err))
+		a.httpOIDCError(writer, req, NewHTTPError(http.StatusBadRequest, "invalid registration id", err))
 		return
 	}
 
 	// Set the state and nonce cookies to protect against CSRF attacks
 	state, err := setCSRFCookie(writer, req, "state")
 	if err != nil {
-		httpError(writer, err)
+		a.httpOIDCError(writer, req, err)
 		return
 	}
 
 	// Set the state and nonce cookies to protect against CSRF attacks
 	nonce, err := setCSRFCookie(writer, req, "nonce")
 	if err != nil {
-		httpError(writer, err)
+		a.httpOIDCError(writer, req, err)
 		return
 	}
 
@@ -195,12 +195,41 @@ type oidcCallbackTemplateConfig struct {
 	Verb string
 }
 
+type oidcErrorTemplateConfig struct {
+	Error     string
+	Code      int
+	RequestID string
+	Timestamp string
+	Debug     string
+	Details   bool
+	LoginURL  string
+}
+
 //go:embed assets/oidc_callback_template.html
 var oidcCallbackTemplateContent string
 
 var oidcCallbackTemplate = template.Must(
 	template.New("oidccallback").Parse(oidcCallbackTemplateContent),
 )
+
+//go:embed assets/oidc_error_template.html
+var oidcErrorTemplateContent string
+
+var oidcErrorTemplate = template.Must(
+	template.New("oidcerror").Parse(oidcErrorTemplateContent),
+)
+
+// httpOIDCError is a specialized error handler for OIDC that provides user-friendly error pages
+func (a *AuthProviderOIDC) httpOIDCError(writer http.ResponseWriter, req *http.Request, err error) {
+	var herr HTTPError
+	if errors.As(err, &herr) {
+		a.renderOIDCErrorTemplate(writer, req, herr)
+	} else {
+		// Create HTTPError from regular error
+		herr = NewHTTPError(http.StatusInternalServerError, "An unexpected error occurred during authentication", err)
+		a.renderOIDCErrorTemplate(writer, req, herr)
+	}
+}
 
 // OIDCCallbackHandler handles the callback from the OIDC endpoint
 // Retrieves the nkey from the state cache and adds the node to the users email user
@@ -213,40 +242,71 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 ) {
 	code, state, err := extractCodeAndStateParamFromRequest(req)
 	if err != nil {
-		httpError(writer, err)
+		log.Error().
+			Err(err).
+			Str("method", "OIDCCallback").
+			Str("url", req.URL.String()).
+			Msg("Failed to extract code and state from OIDC callback")
+		a.httpOIDCError(writer, req, err)
 		return
 	}
 
 	cookieState, err := req.Cookie("state")
 	if err != nil {
-		httpError(writer, NewHTTPError(http.StatusBadRequest, "state not found", err))
+		log.Error().
+			Err(err).
+			Str("method", "OIDCCallback").
+			Msg("State cookie not found in OIDC callback")
+		a.httpOIDCError(writer, req, NewHTTPError(http.StatusBadRequest, "state cookie not found - please try logging in again", err))
 		return
 	}
 
 	if state != cookieState.Value {
-		httpError(writer, NewHTTPError(http.StatusForbidden, "state did not match", nil))
+		log.Error().
+			Str("method", "OIDCCallback").
+			Str("state_param", state).
+			Str("state_cookie", cookieState.Value).
+			Msg("State parameter mismatch in OIDC callback")
+		a.httpOIDCError(writer, req, NewHTTPError(http.StatusForbidden, "state parameter mismatch - possible CSRF attempt", nil))
 		return
 	}
 
 	oauth2Token, err := a.getOauth2Token(req.Context(), code, state)
 	if err != nil {
-		httpError(writer, err)
+		log.Error().
+			Err(err).
+			Str("method", "OIDCCallback").
+			Msg("Failed to exchange authorization code for token")
+		a.httpOIDCError(writer, req, err)
 		return
 	}
 
 	idToken, err := a.extractIDToken(req.Context(), oauth2Token)
 	if err != nil {
-		httpError(writer, err)
+		log.Error().
+			Err(err).
+			Str("method", "OIDCCallback").
+			Msg("Failed to extract or verify ID token")
+		a.httpOIDCError(writer, req, err)
 		return
 	}
 
 	nonce, err := req.Cookie("nonce")
 	if err != nil {
-		httpError(writer, NewHTTPError(http.StatusBadRequest, "nonce not found", err))
+		log.Error().
+			Err(err).
+			Str("method", "OIDCCallback").
+			Msg("Nonce cookie not found in OIDC callback")
+		a.httpOIDCError(writer, req, NewHTTPError(http.StatusBadRequest, "nonce cookie not found - please try logging in again", err))
 		return
 	}
 	if idToken.Nonce != nonce.Value {
-		httpError(writer, NewHTTPError(http.StatusForbidden, "nonce did not match", nil))
+		log.Error().
+			Str("method", "OIDCCallback").
+			Str("token_nonce", idToken.Nonce).
+			Str("cookie_nonce", nonce.Value).
+			Msg("Nonce mismatch in OIDC callback")
+		a.httpOIDCError(writer, req, NewHTTPError(http.StatusForbidden, "nonce mismatch - possible replay attack", nil))
 		return
 	}
 
@@ -254,22 +314,44 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 
 	var claims types.OIDCClaims
 	if err := idToken.Claims(&claims); err != nil {
-		httpError(writer, fmt.Errorf("decoding ID token claims: %w", err))
+		log.Error().
+			Err(err).
+			Str("method", "OIDCCallback").
+			Msg("Failed to decode ID token claims")
+		a.httpOIDCError(writer, req, NewHTTPError(http.StatusBadRequest, "failed to decode ID token claims", fmt.Errorf("decoding ID token claims: %w", err)))
 		return
 	}
 
 	if err := validateOIDCAllowedDomains(a.cfg.AllowedDomains, &claims); err != nil {
-		httpError(writer, err)
+		log.Error().
+			Err(err).
+			Str("method", "OIDCCallback").
+			Str("email", claims.Email).
+			Strs("allowed_domains", a.cfg.AllowedDomains).
+			Msg("User email domain not in allowed domains")
+		a.httpOIDCError(writer, req, err)
 		return
 	}
 
 	if err := validateOIDCAllowedGroups(a.cfg.AllowedGroups, &claims); err != nil {
-		httpError(writer, err)
+		log.Error().
+			Err(err).
+			Str("method", "OIDCCallback").
+			Strs("user_groups", claims.Groups).
+			Strs("allowed_groups", a.cfg.AllowedGroups).
+			Msg("User not in allowed groups")
+		a.httpOIDCError(writer, req, err)
 		return
 	}
 
 	if err := validateOIDCAllowedUsers(a.cfg.AllowedUsers, &claims); err != nil {
-		httpError(writer, err)
+		log.Error().
+			Err(err).
+			Str("method", "OIDCCallback").
+			Str("user_email", claims.Email).
+			Strs("allowed_users", a.cfg.AllowedUsers).
+			Msg("User not in allowed users list")
+		a.httpOIDCError(writer, req, err)
 		return
 	}
 
@@ -301,18 +383,12 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 	if err != nil {
 		log.Error().
 			Err(err).
-			Caller().
-			Msgf("could not create or update user")
-		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		writer.WriteHeader(http.StatusInternalServerError)
-		_, werr := writer.Write([]byte("Could not create or update user"))
-		if werr != nil {
-			log.Error().
-				Caller().
-				Err(werr).
-				Msg("Failed to write response")
-		}
-
+			Str("method", "OIDCCallback").
+			Str("email", claims.Email).
+			Str("sub", claims.Sub).
+			Str("oidc_identifier", claims.Identifier()).
+			Msg("Failed to create or update user from OIDC claims")
+		a.httpOIDCError(writer, req, NewHTTPError(http.StatusInternalServerError, "failed to create or update user account", err))
 		return
 	}
 
@@ -333,7 +409,13 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		verb := "Reauthenticated"
 		newNode, err := a.handleRegistration(user, *registrationId, nodeExpiry)
 		if err != nil {
-			httpError(writer, err)
+			log.Error().
+				Err(err).
+				Str("method", "OIDCCallback").
+				Str("user", user.Name).
+				Str("registration_id", registrationId.String()).
+				Msg("Failed to handle node registration")
+			a.httpOIDCError(writer, req, NewHTTPError(http.StatusInternalServerError, "failed to register node", err))
 			return
 		}
 
@@ -359,7 +441,11 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 
 	// Neither node nor machine key was found in the state cache meaning
 	// that we could not reauth nor register the node.
-	httpError(writer, NewHTTPError(http.StatusGone, "login session expired, try again", nil))
+	log.Error().
+		Str("method", "OIDCCallback").
+		Str("state", state).
+		Msg("Registration ID not found in state cache - session expired")
+	a.httpOIDCError(writer, req, NewHTTPError(http.StatusGone, "login session expired - please try logging in again", errOIDCInvalidNodeState))
 
 	return
 }
@@ -371,7 +457,7 @@ func extractCodeAndStateParamFromRequest(
 	state := req.URL.Query().Get("state")
 
 	if code == "" || state == "" {
-		return "", "", NewHTTPError(http.StatusBadRequest, "missing code or state parameter", errEmptyOIDCCallbackParams)
+		return "", "", NewHTTPError(http.StatusBadRequest, "missing required parameters - code or state parameter is empty", errEmptyOIDCCallbackParams)
 	}
 
 	return code, state, nil
@@ -388,7 +474,7 @@ func (a *AuthProviderOIDC) getOauth2Token(
 	if a.cfg.PKCE.Enabled {
 		regInfo, ok := a.registrationCache.Get(state)
 		if !ok {
-			return nil, NewHTTPError(http.StatusNotFound, "registration not found", errNoOIDCRegistrationInfo)
+			return nil, NewHTTPError(http.StatusNotFound, "registration info not found - session may have expired", errNoOIDCRegistrationInfo)
 		}
 		if regInfo.Verifier != nil {
 			exchangeOpts = []oauth2.AuthCodeOption{oauth2.VerifierOption(*regInfo.Verifier)}
@@ -397,7 +483,7 @@ func (a *AuthProviderOIDC) getOauth2Token(
 
 	oauth2Token, err := a.oauth2Config.Exchange(ctx, code, exchangeOpts...)
 	if err != nil {
-		return nil, NewHTTPError(http.StatusForbidden, "invalid code", fmt.Errorf("could not exchange code for token: %w", err))
+		return nil, NewHTTPError(http.StatusForbidden, "failed to exchange authorization code - the code may be invalid or expired", fmt.Errorf("could not exchange code for token: %w", err))
 	}
 
 	return oauth2Token, err
@@ -410,13 +496,13 @@ func (a *AuthProviderOIDC) extractIDToken(
 ) (*oidc.IDToken, error) {
 	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
 	if !ok {
-		return nil, NewHTTPError(http.StatusBadRequest, "no id_token", errNoOIDCIDToken)
+		return nil, NewHTTPError(http.StatusBadRequest, "no ID token in OAuth2 response - check OIDC provider configuration", errNoOIDCIDToken)
 	}
 
 	verifier := a.oidcProvider.Verifier(&oidc.Config{ClientID: a.cfg.ClientID})
 	idToken, err := verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		return nil, NewHTTPError(http.StatusForbidden, "failed to verify id_token", fmt.Errorf("failed to verify ID token: %w", err))
+		return nil, NewHTTPError(http.StatusForbidden, "ID token verification failed - token may be invalid or expired", fmt.Errorf("failed to verify ID token: %w", err))
 	}
 
 	return idToken, nil
@@ -431,7 +517,11 @@ func validateOIDCAllowedDomains(
 	if len(allowedDomains) > 0 {
 		if at := strings.LastIndex(claims.Email, "@"); at < 0 ||
 			!slices.Contains(allowedDomains, claims.Email[at+1:]) {
-			return NewHTTPError(http.StatusUnauthorized, "unauthorised domain", errOIDCAllowedDomains)
+			domain := ""
+			if at >= 0 {
+				domain = claims.Email[at+1:]
+			}
+			return NewHTTPError(http.StatusUnauthorized, fmt.Sprintf("email domain '%s' is not in the allowed domains list", domain), errOIDCAllowedDomains)
 		}
 	}
 
@@ -453,7 +543,7 @@ func validateOIDCAllowedGroups(
 			}
 		}
 
-		return NewHTTPError(http.StatusUnauthorized, "unauthorised group", errOIDCAllowedGroups)
+		return NewHTTPError(http.StatusUnauthorized, "user is not a member of any allowed groups", errOIDCAllowedGroups)
 	}
 
 	return nil
@@ -467,7 +557,7 @@ func validateOIDCAllowedUsers(
 ) error {
 	if len(allowedUsers) > 0 &&
 		!slices.Contains(allowedUsers, claims.Email) {
-		return NewHTTPError(http.StatusUnauthorized, "unauthorised user", errOIDCAllowedUsers)
+		return NewHTTPError(http.StatusUnauthorized, fmt.Sprintf("user '%s' is not in the allowed users list", claims.Email), errOIDCAllowedUsers)
 	}
 
 	return nil
@@ -589,6 +679,42 @@ func renderOIDCCallbackTemplate(
 	}
 
 	return &content, nil
+}
+
+func (a *AuthProviderOIDC) renderOIDCErrorTemplate(
+	writer http.ResponseWriter,
+	req *http.Request,
+	httpErr HTTPError,
+) {
+	requestID, _ := util.GenerateRandomStringURLSafe(8)
+	
+	config := oidcErrorTemplateConfig{
+		Error:     httpErr.Msg,
+		Code:      httpErr.Code,
+		RequestID: requestID,
+		Timestamp: time.Now().Format(time.RFC3339),
+		LoginURL:  a.serverURL,
+		Details:   true,
+	}
+	
+	// Add debug information if available
+	if httpErr.Err != nil {
+		config.Debug = httpErr.Err.Error()
+	}
+	
+	var content bytes.Buffer
+	if err := oidcErrorTemplate.Execute(&content, config); err != nil {
+		// Fallback to simple error if template fails
+		log.Error().Err(err).Msg("Failed to render OIDC error template")
+		http.Error(writer, httpErr.Msg, httpErr.Code)
+		return
+	}
+	
+	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+	writer.WriteHeader(httpErr.Code)
+	if _, err := writer.Write(content.Bytes()); err != nil {
+		util.LogErr(err, "Failed to write error response")
+	}
 }
 
 func setCSRFCookie(w http.ResponseWriter, r *http.Request, name string) (string, error) {
