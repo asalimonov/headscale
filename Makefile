@@ -43,6 +43,13 @@ build: check-deps $(GO_SOURCES) go.mod go.sum
 	@echo "Building headscale..."
 	go build $(PIE_FLAGS) -ldflags "-X main.version=$(VERSION)" -o headscale ./cmd/headscale
 
+# Build targets
+.PHONY: build-docker
+build-docker:
+	@echo "Building docker images for headscale..."
+	docker build -f Dockerfile --build-arg GOARCH=amd64 -t headscale:latest -t headscale:$(VERSION) .
+	docker build -f Dockerfile --build-arg GOARCH=arm64 -t headscale:latest-arm64 -t headscale:$(VERSION)-arm64 .
+
 # Test targets
 .PHONY: test
 test: check-deps $(GO_SOURCES) go.mod go.sum
